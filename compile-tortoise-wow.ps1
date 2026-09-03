@@ -309,18 +309,53 @@ Step "Configuring with CMake"
 Push-Location $SourceDir
 $buildDir = "build"
 $vcpkgInstalled = "$VcpkgDir\installed\x64-windows"
+$cmakeCache = Join-Path $buildDir "CMakeCache.txt"
+
+# CMake keeps old -D values in an existing build directory. A failed build from
+# before the 2026-09 module-system fix can still have playerbots configured as
+# disabled even after this script is updated, so explicitly repair that one
+# stale cache entry instead of asking users to delete the whole 20+ minute build.
+if (Test-Path $cmakeCache) {
+    $cacheContent = Get-Content $cmakeCache -Raw
+    $cacheContent = $cacheContent -replace '(?m)^BUILD_PLAYERBOTS:BOOL=.*$', "BUILD_PLAYERBOTS:BOOL=$(if ($BuildPlayerbots) {'ON'} else {'OFF'})"
+    $cacheContent = $cacheContent -replace '(?m)^USE_EXTRACTORS:BOOL=.*$', "USE_EXTRACTORS:BOOL=$(if ($UseExtractors) {'ON'} else {'OFF'})"
+    if ($BuildPlayerbots) {
+        $cacheContent = $cacheContent -replace '(?m)^MODULES:[^=]+=.*$', 'MODULES:STRING=disabled'
+        $cacheContent = $cacheContent -replace '(?m)^MODULE_MOD_PLAYERBOTS:[^=]+=.*$', 'MODULE_MOD_PLAYERBOTS:STRING=static'
+    }
+    Set-Content $cmakeCache $cacheContent -Encoding ASCII
+}
 
 $cmakeArgs = @(
+    "-S", $SourceDir,
     "-B", $buildDir, "-A", "x64",
     "-DCMAKE_INSTALL_PREFIX=$InstallPrefix",
     "-DUSE_EXTRACTORS=$(if ($UseExtractors) {'ON'} else {'OFF'})",
     "-DBUILD_PLAYERBOTS=$(if ($BuildPlayerbots) {'ON'} else {'OFF'})",
     "-DACE_ROOT=$vcpkgInstalled"
 )
-if ($BuildPlayerbots) { $cmakeArgs += "-DBOOST_ROOT=$vcpkgInstalled" }
+if ($BuildPlayerbots) {
+    # Since the 2026-09 playerbots module refactor, BUILD_PLAYERBOTS=ON only
+    # builds the hook stubs unless the module system is also enabled. Keep
+    # unrelated modules (such as mod-dungeon-clear) disabled and statically
+    # link just mod-playerbots into mangosd.
+    $cmakeArgs += @(
+        "-DMODULES=disabled",
+        "-DMODULE_MOD_PLAYERBOTS=static",
+        "-DBOOST_ROOT=$vcpkgInstalled"
+    )
+}
 
 & cmake @cmakeArgs
 if ($LASTEXITCODE -ne 0) { Fail "CMake configure failed. Look for 'Found ACE headers:' in the output above to confirm ACE was located." }
+
+if ($BuildPlayerbots -and (Test-Path $cmakeCache)) {
+    $configuredCache = Get-Content $cmakeCache -Raw
+    if ($configuredCache -notmatch '(?m)^MODULE_MOD_PLAYERBOTS:[^=]+=static\s*$' -or
+        $configuredCache -notmatch '(?m)^BUILD_PLAYERBOTS:[^=]+=ON\s*$') {
+        Fail "CMake configured but mod-playerbots is not enabled as a static module. Delete $buildDir and re-run if this stale build directory cannot be repaired automatically."
+    }
+}
 Ok "Configure complete"
 
 Step "Building (Release config) - this is the slow part, easily 20-40+ minutes"
@@ -359,7 +394,7 @@ FLUSH PRIVILEGES;
 "@ $null
 Ok "'mangos' user created and granted on all 4 databases"
 
-Step "Importing world content from sql\base (186 files, can take a few minutes)"
+Step "Importing world content from sql\base (can take a few minutes)"
 Get-ChildItem "$SourceDir\sql\base\*.sql" | ForEach-Object {
     Invoke-SqlFile $_.FullName "tw_world"
 }
@@ -369,15 +404,27 @@ Step "Applying schema migrations (tolerating duplicate-key errors on purpose, pe
 # -Recurse matters: a chunk of the migration files live in subfolders like
 # sql\database_updates\world\, not directly in sql\database_updates\. Missing
 # those caused a "database structure is not up to date" crash on first start.
-Get-ChildItem "$SourceDir\sql\database_updates" -Recurse -Filter "*.sql" | Sort-Object Name | ForEach-Object {
-    Invoke-SqlFile $_.FullName "tw_world" @("--force")
-    Invoke-Sql "INSERT IGNORE INTO migrations (Name,Hash,AppliedAt) VALUES ('$($_.BaseName)','manual',NOW());" "tw_world"
+Get-ChildItem "$SourceDir\sql\database_updates" -Recurse -Filter "*.sql" | Sort-Object FullName | ForEach-Object {
+    if ($_.Name -match '_(character|char)\.sql$') {
+        $migrationDb = "tw_char"
+    } elseif ($_.Name -match '_(auth|logon)\.sql$') {
+        $migrationDb = "tw_logon"
+    } else {
+        $migrationDb = "tw_world"
+    }
+    Invoke-SqlFile $_.FullName $migrationDb @("--force")
+    Invoke-Sql "INSERT IGNORE INTO migrations (Name,Hash,AppliedAt) VALUES ('$($_.BaseName)','manual',NOW());" $migrationDb
 }
 Ok "Migrations applied and recorded"
 
 if ($BuildPlayerbots) {
     Step "Importing playerbot tables"
-    $pbSqlDir = "$SourceDir\src\modules\PlayerBots\sql"
+    # The 2026-09 source refactor moved the vendored playerbots module from
+    # src\modules\PlayerBots to modules\mod-playerbots. Support both layouts so
+    # reruns against an older checkout still work.
+    $pbSqlDir = "$SourceDir\modules\mod-playerbots\sql"
+    if (-not (Test-Path $pbSqlDir)) { $pbSqlDir = "$SourceDir\src\modules\PlayerBots\sql" }
+    if (-not (Test-Path $pbSqlDir)) { Fail "Playerbot SQL directory not found under the checked-out source (expected modules\mod-playerbots\sql)." }
     Get-ChildItem "$pbSqlDir\world\*.sql" | ForEach-Object { Invoke-SqlFile $_.FullName "tw_world" }
     Get-ChildItem "$pbSqlDir\world\classic\*.sql" | ForEach-Object { Invoke-SqlFile $_.FullName "tw_world" }
     Get-ChildItem "$pbSqlDir\characters\*.sql" | ForEach-Object { Invoke-SqlFile $_.FullName "tw_char" }
@@ -396,12 +443,25 @@ $configMap = @{
     "ahbot.conf.dist"       = "ahbot.conf"
 }
 foreach ($distName in $configMap.Keys) {
+    $realName = $configMap[$distName]
     $distPath = Join-Path $InstallPrefix $distName
-    $realPath = Join-Path $InstallPrefix $configMap[$distName]
+    $realPath = Join-Path $InstallPrefix $realName
+
+    # Upstream installs aiplayerbot.conf.dist, but the current mod-playerbots
+    # CMake rules omit ahbot.conf.dist. Copy that template directly from source
+    # so AhBot does not silently run without a config file.
+    if ($BuildPlayerbots -and $distName -eq "ahbot.conf.dist" -and -not (Test-Path $distPath)) {
+        $ahbotTemplate = Join-Path $SourceDir "modules\mod-playerbots\src\ahbot\ahbot.conf.dist.in"
+        if (Test-Path $ahbotTemplate) {
+            Copy-Item $ahbotTemplate $distPath
+            Ok "Copied missing ahbot.conf.dist from mod-playerbots source"
+        }
+    }
+
     if (-not (Test-Path $distPath)) { Warn "$distName not found in $InstallPrefix - skipping (playerbot templates only exist if BUILD_PLAYERBOTS was ON)"; continue }
-    if (Test-Path $realPath) { Ok "$($configMap[$distName]) already exists - leaving it alone (delete it and re-run if you want it regenerated)"; continue }
+    if (Test-Path $realPath) { Ok "$realName already exists - leaving it alone (delete it and re-run if you want it regenerated)"; continue }
     Copy-Item $distPath $realPath
-    Ok "Created $($configMap[$distName])"
+    Ok "Created $realName"
 }
 
 $mangosdConfPath = Join-Path $InstallPrefix "mangosd.conf"
@@ -461,18 +521,26 @@ if ([int]$existingRealms -eq 0) {
 # ---------------------------------------------------------------------------------------
 if ($ClientDir -and (Test-Path $ClientDir)) {
     Step "Attempting client data extraction into $ClientDir (experimental)"
-    $toolsDir = Join-Path $SourceDir "tools"
-    if (-not (Test-Path $toolsDir)) {
-        Warn "No tools\ folder in $SourceDir - USE_EXTRACTORS may not have been ON. Skipping."
+    $extractTools = @(
+        @{ Name = "mapextractor.exe";  Produces = "dbc/maps" },
+        @{ Name = "vmapextractor.exe"; Produces = "vmap source data" },
+        @{ Name = "vmap_assembler.exe"; Produces = "vmaps" },
+        @{ Name = "MoveMapGen.exe";    Produces = "mmaps (slow - an hour or more is normal)" }
+    )
+    $missingTools = $extractTools | Where-Object { -not (Test-Path (Join-Path $InstallPrefix $_.Name)) }
+    if ($missingTools) {
+        Warn "Extractor tool(s) not found in $InstallPrefix ($(($missingTools | ForEach-Object { $_.Name }) -join ', ')) - USE_EXTRACTORS may not have been ON. Skipping."
     } else {
-        Copy-Item "$toolsDir\*" $ClientDir -Force -Recurse
+        foreach ($tool in $extractTools) {
+            Copy-Item (Join-Path $InstallPrefix $tool.Name) $ClientDir -Force
+        }
+        # Extractors load these project DLLs from their working directory.
+        foreach ($dll in @("libmpq.dll", "libmySQL.dll")) {
+            $dllPath = Join-Path $InstallPrefix $dll
+            if (Test-Path $dllPath) { Copy-Item $dllPath $ClientDir -Force }
+        }
         Push-Location $ClientDir
-        $extractSteps = @(
-            @{ Name = "extractor.exe";       Produces = "dbc/maps" },
-            @{ Name = "vmap_extractor.exe";  Produces = "vmap source data" },
-            @{ Name = "vmap_assembler.exe";  Produces = "vmaps" },
-            @{ Name = "mmap.exe";            Produces = "mmaps (slow - an hour or more is normal)" }
-        )
+        $extractSteps = $extractTools
         $extractionOk = $true
         foreach ($tool in $extractSteps) {
             if (-not (Test-Path $tool.Name)) { Warn "$($tool.Name) not found in $ClientDir - skipping remaining extraction steps."; $extractionOk = $false; break }
@@ -553,7 +621,7 @@ Write-Host "Realm:                      $RealmName at $RealmAddress`:$worldPort"
 Write-Host "`nTo start the server from now on, just run:  $InstallPrefix\start-all.bat" -ForegroundColor Green
 Write-Host "`nGenuinely still manual:" -ForegroundColor Yellow
 if (-not ($ClientDir -and (Test-Path $ClientDir))) {
-    Write-Host "  1. Extract client data - copy tools from $SourceDir\tools into your Turtle WoW 1.18.1 build 7272 client and run, in order: extractor, vmap_extractor, vmap_assembler, mmap. Move the resulting dbc/maps/vmaps/mmaps folders into $InstallPrefix."
+    Write-Host "  1. Extract client data - copy mapextractor.exe, vmapextractor.exe, vmap_assembler.exe and MoveMapGen.exe (plus any DLLs they require) from $InstallPrefix into your Turtle WoW 1.18.1 build 7272 client and run them in that order. Move the resulting dbc/maps/vmaps/mmaps folders into $InstallPrefix."
     Write-Host "     (Set `$ClientDir near the top of this script and re-run to attempt this automatically next time.)"
 } else {
     Write-Host "  1. Client data extraction was attempted automatically - double check dbc/maps/vmaps/mmaps landed in $InstallPrefix and look reasonable in size."

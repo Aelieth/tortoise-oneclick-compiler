@@ -40,8 +40,9 @@ $Branch          = "playerbots-integration-gh"
 $SourceDir       = "$RootDir\source"
 $VcpkgDir        = "$RootDir\vcpkg"
 $InstallPrefix   = "$RootDir\server"
-$BuildPlayerbots = $true      # $false = a server with no bots at all
-$UseExtractors   = $true      # $false only if you already have dbc/maps/vmaps/mmaps
+$BuildPlayerbots  = $true     # $false = a server with no bots at all
+$BuildDungeonClear = $true    # smarter bot dungeon-clearing module; requires playerbots
+$UseExtractors    = $true     # $false only if you already have dbc/maps/vmaps/mmaps
 
 $DbFolder        = "$RootDir\DB"   # portable MariaDB lives here, not installed as a service
 $DbPort          = 3307            # off the default 3306 so it never collides with a real install
@@ -68,6 +69,11 @@ function Ok($msg)   { Write-Host "[OK] $msg" -ForegroundColor Green }
 function Warn($msg) { Write-Host "[WARN] $msg" -ForegroundColor Yellow }
 function Fail($msg) { Write-Host "`n[FAILED] $msg" -ForegroundColor Red; Read-Host "`nPress Enter to close"; exit 1 }
 
+if ($BuildDungeonClear -and -not $BuildPlayerbots) {
+    Warn "DungeonClear requires BUILD_PLAYERBOTS; disabling DungeonClear for this build."
+    $BuildDungeonClear = $false
+}
+
 # ---------------------------------------------------------------------------------------
 # 0. Relaunch elevated - winget installs (esp. VS Build Tools) need admin rights
 # ---------------------------------------------------------------------------------------
@@ -84,7 +90,7 @@ Write-Host "  source:   $SourceDir"
 Write-Host "  vcpkg:    $VcpkgDir"
 Write-Host "  server:   $InstallPrefix"
 Write-Host "  database: $DbFolder (portable, port $DbPort)"
-Write-Host "Playerbots: $BuildPlayerbots | Extractors: $UseExtractors | Client data automation: $(if ($ClientDir) {$ClientDir} else {'off (manual)'})"
+Write-Host "Playerbots: $BuildPlayerbots | DungeonClear: $BuildDungeonClear | Extractors: $UseExtractors | Client data automation: $(if ($ClientDir) {$ClientDir} else {'off (manual)'})"
 Write-Host "(Git, CMake, and VS Build Tools install system-wide if missing - those are dev tools, not project data)`n"
 
 if ($RootDir.Length -gt 40) {
@@ -319,41 +325,43 @@ if (Test-Path $cmakeCache) {
     $cacheContent = Get-Content $cmakeCache -Raw
     $cacheContent = $cacheContent -replace '(?m)^BUILD_PLAYERBOTS:BOOL=.*$', "BUILD_PLAYERBOTS:BOOL=$(if ($BuildPlayerbots) {'ON'} else {'OFF'})"
     $cacheContent = $cacheContent -replace '(?m)^USE_EXTRACTORS:BOOL=.*$', "USE_EXTRACTORS:BOOL=$(if ($UseExtractors) {'ON'} else {'OFF'})"
-    if ($BuildPlayerbots) {
-        $cacheContent = $cacheContent -replace '(?m)^MODULES:[^=]+=.*$', 'MODULES:STRING=disabled'
-        $cacheContent = $cacheContent -replace '(?m)^MODULE_MOD_PLAYERBOTS:[^=]+=.*$', 'MODULE_MOD_PLAYERBOTS:STRING=static'
-    }
+    $cacheContent = $cacheContent -replace '(?m)^MODULES:[^=]+=.*$', 'MODULES:STRING=disabled'
+    $cacheContent = $cacheContent -replace '(?m)^MODULE_MOD_PLAYERBOTS:[^=]+=.*$', "MODULE_MOD_PLAYERBOTS:STRING=$(if ($BuildPlayerbots) {'static'} else {'disabled'})"
+    $cacheContent = $cacheContent -replace '(?m)^MODULE_MOD_DUNGEON_CLEAR:[^=]+=.*$', "MODULE_MOD_DUNGEON_CLEAR:STRING=$(if ($BuildDungeonClear) {'static'} else {'disabled'})"
     Set-Content $cmakeCache $cacheContent -Encoding ASCII
 }
 
+# Since the 2026-09 playerbots refactor, leave the global module default
+# disabled and explicitly enable the static bot modules we want. This avoids
+# accidentally pulling in future modules while still letting mod-playerbots and
+# mod-dungeon-clear link directly into mangosd on Windows.
 $cmakeArgs = @(
     "-S", $SourceDir,
     "-B", $buildDir, "-A", "x64",
     "-DCMAKE_INSTALL_PREFIX=$InstallPrefix",
     "-DUSE_EXTRACTORS=$(if ($UseExtractors) {'ON'} else {'OFF'})",
     "-DBUILD_PLAYERBOTS=$(if ($BuildPlayerbots) {'ON'} else {'OFF'})",
+    "-DMODULES=disabled",
+    "-DMODULE_MOD_PLAYERBOTS=$(if ($BuildPlayerbots) {'static'} else {'disabled'})",
+    "-DMODULE_MOD_DUNGEON_CLEAR=$(if ($BuildDungeonClear) {'static'} else {'disabled'})",
     "-DACE_ROOT=$vcpkgInstalled"
 )
 if ($BuildPlayerbots) {
-    # Since the 2026-09 playerbots module refactor, BUILD_PLAYERBOTS=ON only
-    # builds the hook stubs unless the module system is also enabled. Keep
-    # unrelated modules (such as mod-dungeon-clear) disabled and statically
-    # link just mod-playerbots into mangosd.
-    $cmakeArgs += @(
-        "-DMODULES=disabled",
-        "-DMODULE_MOD_PLAYERBOTS=static",
-        "-DBOOST_ROOT=$vcpkgInstalled"
-    )
+    $cmakeArgs += "-DBOOST_ROOT=$vcpkgInstalled"
 }
 
 & cmake @cmakeArgs
 if ($LASTEXITCODE -ne 0) { Fail "CMake configure failed. Look for 'Found ACE headers:' in the output above to confirm ACE was located." }
 
-if ($BuildPlayerbots -and (Test-Path $cmakeCache)) {
+if (Test-Path $cmakeCache) {
     $configuredCache = Get-Content $cmakeCache -Raw
-    if ($configuredCache -notmatch '(?m)^MODULE_MOD_PLAYERBOTS:[^=]+=static\s*$' -or
-        $configuredCache -notmatch '(?m)^BUILD_PLAYERBOTS:[^=]+=ON\s*$') {
-        Fail "CMake configured but mod-playerbots is not enabled as a static module. Delete $buildDir and re-run if this stale build directory cannot be repaired automatically."
+    $expectedPlayerbotMode = if ($BuildPlayerbots) { 'ON' } else { 'OFF' }
+    $expectedPlayerbotModuleMode = if ($BuildPlayerbots) { 'static' } else { 'disabled' }
+    $expectedDungeonClearMode = if ($BuildDungeonClear) { 'static' } else { 'disabled' }
+    if ($configuredCache -notmatch "(?m)^BUILD_PLAYERBOTS:[^=]+=$expectedPlayerbotMode\s*$" -or
+        $configuredCache -notmatch "(?m)^MODULE_MOD_PLAYERBOTS:[^=]+=$expectedPlayerbotModuleMode\s*$" -or
+        $configuredCache -notmatch "(?m)^MODULE_MOD_DUNGEON_CLEAR:[^=]+=$expectedDungeonClearMode\s*$") {
+        Fail "CMake configured but the playerbot modules do not match this script's settings. Delete $buildDir and re-run if this stale build directory cannot be repaired automatically."
     }
 }
 Ok "Configure complete"
@@ -462,6 +470,25 @@ foreach ($distName in $configMap.Keys) {
     if (Test-Path $realPath) { Ok "$realName already exists - leaving it alone (delete it and re-run if you want it regenerated)"; continue }
     Copy-Item $distPath $realPath
     Ok "Created $realName"
+}
+
+$moduleConfigDir = Join-Path $InstallPrefix "modules"
+if ($BuildDungeonClear) {
+    $dcDist = Join-Path $moduleConfigDir "mod_dungeon_clear.conf.dist"
+    $dcConf = Join-Path $moduleConfigDir "mod_dungeon_clear.conf"
+    if (-not (Test-Path $dcDist)) {
+        New-Item -ItemType Directory -Force -Path $moduleConfigDir | Out-Null
+        $dcTemplate = Join-Path $SourceDir "modules\mod-dungeon-clear\conf\mod_dungeon_clear.conf.dist"
+        if (Test-Path $dcTemplate) { Copy-Item $dcTemplate $dcDist }
+    }
+    if ((Test-Path $dcDist) -and -not (Test-Path $dcConf)) {
+        Copy-Item $dcDist $dcConf
+        Ok "Created modules\mod_dungeon_clear.conf"
+    } elseif (Test-Path $dcConf) {
+        Ok "modules\mod_dungeon_clear.conf already exists - leaving it alone"
+    } else {
+        Warn "mod_dungeon_clear.conf.dist not found; DungeonClear will use built-in defaults"
+    }
 }
 
 $mangosdConfPath = Join-Path $InstallPrefix "mangosd.conf"

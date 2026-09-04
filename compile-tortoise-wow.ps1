@@ -306,6 +306,11 @@ if (-not (Test-Path $SourceDir)) {
     git pull origin $Branch
     Pop-Location
 }
+Write-Host "Initializing git submodules (e.g. Eluna)..."
+Push-Location $SourceDir
+git submodule update --init --recursive
+if ($LASTEXITCODE -ne 0) { Fail "Could not initialize git submodules. Try running 'git submodule update --init --recursive' by hand from $SourceDir and re-run this script." }
+Pop-Location
 Ok "Source ready at $SourceDir"
 
 # ---------------------------------------------------------------------------------------
